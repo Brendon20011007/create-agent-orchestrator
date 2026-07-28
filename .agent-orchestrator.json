@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "project": {
+    "name": "create-agent-orchestrator",
+    "type": "Library or package",
+    "stack": "Node.js ESM, zero runtime dependencies",
+    "sourceDirectories": [
+      "bin",
+      "src",
+      "test"
+    ]
+  },
+  "commands": {
+    "dev": "Not applicable",
+    "test": "npm run check"
+  },
+  "branches": {
+    "staging": "staging",
+    "production": "main"
+  },
+  "github": {
+    "enabled": true,
+    "milestonePolicy": "create-if-missing"
+  },
+  "orchestration": {
+    "onboardingApproval": "per-task",
+    "mainMayImplement": false,
+    "maxConcurrentSpecialists": 3
+  },
+  "approvals": {
+    "bindToCommit": true,
+    "invalidateOnNewCommit": true,
+    "requirePrOpenAuthorization": true,
+    "requireMergeAuthorization": true
+  },
+  "permanentRoles": [
+    "Main Agent",
+    "HR Agent"
+  ],
+  "specialists": []
+}

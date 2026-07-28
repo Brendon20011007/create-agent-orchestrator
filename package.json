@@ -1,0 +1,48 @@
+{
+  "name": "create-agent-orchestrator",
+  "version": "0.1.0",
+  "description": "Interactive initializer for a user-approved, GitHub-first agent orchestration workflow.",
+  "type": "module",
+  "bin": {
+    "create-agent-orchestrator": "bin/create-agent-orchestrator.js"
+  },
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "lint": "node --check bin/create-agent-orchestrator.js && node --check src/args.js && node --check src/cli.js && node --check src/prompts.js && node --check src/scaffold.js && node --check src/templates.js",
+    "check": "npm run lint && npm test && npm pack --dry-run"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "agent",
+    "claude",
+    "claude-code",
+    "github",
+    "orchestrator",
+    "project-template",
+    "scaffolding",
+    "worktree"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Brendon20011007/create-agent-orchestrator.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Brendon20011007/create-agent-orchestrator/issues"
+  },
+  "homepage": "https://github.com/Brendon20011007/create-agent-orchestrator#readme",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  }
+}
