@@ -7,7 +7,7 @@ import path from "node:path";
 import { UsageError } from "../src/args.js";
 import { normalizeConfig } from "../src/config.js";
 import { contentHash, writeScaffold } from "../src/scaffold.js";
-import { applyManagedSections, syncProject } from "../src/sync.js";
+import { applyManagedSections, SYNC_NO_DIRECTORY, SYNC_NOT_INITIALIZED, syncProject } from "../src/sync.js";
 import { parseRoster } from "../src/team.js";
 import { renderPullRequestTemplate, renderTaskboardTemplate } from "../src/templates.js";
 
@@ -590,6 +590,49 @@ test("sync needs an initialized project", async () => {
 
     await write(directory, CONFIG, JSON.stringify({ schemaVersion: 3 }));
     await assert.rejects(() => syncProject(directory), /newer create-agent-orchestrator/);
+  });
+});
+
+test("sync tells a missing target folder apart from one that is not initialized", async () => {
+  const rejection = (code, message) => (error) => {
+    assert.ok(error instanceof UsageError);
+    assert.equal(error.code, code);
+    assert.equal(error.message, message);
+    return true;
+  };
+
+  await withDirectory(async (directory) => {
+    const missing = path.join(directory, "missing");
+    const file = path.join(directory, "notes.txt");
+    const empty = path.join(directory, "empty");
+    await write(directory, "notes.txt", "notes\n");
+    await mkdir(empty);
+
+    await assert.rejects(() => syncProject(missing), rejection(SYNC_NO_DIRECTORY, `${missing} does not exist.`));
+    await assert.rejects(
+      () => syncProject(path.join(file, "nested"), { dryRun: true }),
+      rejection(SYNC_NO_DIRECTORY, `${path.join(file, "nested")} does not exist.`),
+    );
+    await assert.rejects(() => syncProject(file), rejection(SYNC_NO_DIRECTORY, `${file} is not a directory.`));
+    await assert.rejects(
+      () => syncProject(empty),
+      rejection(
+        SYNC_NOT_INITIALIZED,
+        `${CONFIG} was not found in ${empty}. Initialize the project first: create-agent-orchestrator <target-directory>.`,
+      ),
+    );
+    assert.deepEqual((await readdir(directory)).sort(), ["empty", "notes.txt"]);
+    assert.deepEqual(await readdir(empty), []);
+
+    await write(empty, CONFIG, "{}");
+    await assert.rejects(
+      () => syncProject(empty, { migrate: true }),
+      rejection(
+        SYNC_NOT_INITIALIZED,
+        `CLAUDE.md was not found in ${empty}. Initialize the project first: create-agent-orchestrator <target-directory>.`,
+      ),
+    );
+    assert.deepEqual(await readdir(empty), [CONFIG]);
   });
 });
 

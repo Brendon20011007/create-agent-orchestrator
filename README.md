@@ -82,10 +82,14 @@ Run `npx create-agent-orchestrator@latest --help` for every option.
 
 ## Keeping a project current: `sync`
 
+Run these inside the project folder:
+
 ```bash
-npx create-agent-orchestrator@latest sync            # the current directory
-npx create-agent-orchestrator@latest sync ./my-project --dry-run
+npx create-agent-orchestrator@latest sync --dry-run    # preview; writes nothing
+npx create-agent-orchestrator@latest sync
 ```
+
+`sync` works on the current folder; when you run it from somewhere else, pass the project's folder instead, as `sync <path-to-project>`.
 
 `sync` brings the workflow rules of an initialized project up to the installed version:
 
@@ -103,7 +107,7 @@ npx create-agent-orchestrator@latest sync ./my-project --dry-run
 
 ### Migrating from 0.1.x
 
-A project created by 0.1.x has a `CLAUDE.md` with no managed sections, so plain `sync` stops and writes nothing. Convert it once:
+A project created by 0.1.x has a `CLAUDE.md` with no managed sections, so plain `sync` stops and writes nothing. Convert it once. Run these inside the project folder.
 
 ```bash
 npx create-agent-orchestrator@latest sync --migrate --dry-run   # preview
@@ -157,7 +161,7 @@ npm create agent-orchestrator@latest .
 
 初始化完成后请重启 Claude Code，因为 Agent 文件只在会话启动时加载。
 
-把最新的流程规则同步到已初始化的项目：
+把最新的流程规则同步到已初始化的项目。在项目目录内运行 `sync`，不需要加目录参数：
 
 ```bash
 npx create-agent-orchestrator@latest sync
@@ -165,7 +169,7 @@ npx create-agent-orchestrator@latest sync
 
 `sync` 只重写 `CLAUDE.md` 中由 `agent-orchestrator:start` 和 `agent-orchestrator:end` 标记包住的部分，以及未被手动修改过的 GitHub 模板。**它不会改动已有的子 Agent 团队**：不会在 `.claude/agents/` 中新建、修改、重命名或删除任何文件，也不会改动名单表格中的任何一行。标记之外的内容保持原样。加 `--dry-run` 可以只预览不写入。
 
-由 0.1.x 创建的项目需要先迁移一次：
+由 0.1.x 创建的项目需要先迁移一次，同样在项目目录内运行：
 
 ```bash
 npx create-agent-orchestrator@latest sync --migrate
