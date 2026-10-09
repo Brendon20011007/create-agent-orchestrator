@@ -1,369 +1,801 @@
+const MARKER = "agent-orchestrator";
+
+export const MANAGED_SECTION_IDS = [
+  "intro",
+  "ownership",
+  "orchestrator-rules",
+  "task-workflow-local",
+  "task-workflow-release",
+  "merging",
+  "github-planning",
+  "hr-rules",
+];
+
+const SYNC_NOTE =
+  '<!-- Managed by create-agent-orchestrator: the text between each pair of "start" and "end" marker comments is rewritten by `create-agent-orchestrator sync`. Everything else in this file is the project\'s to edit. -->';
+
+const FILL_STACK_TRAPS =
+  '<!-- FILL: stack traps. In 2–6 lines, state anything an agent would get wrong by assuming defaults: two toolchains that are both current, a service the code supports but no environment provisions, a dependency that is old on purpose. Say what is current and why, so nobody "fixes" it. Then delete this comment. -->';
+
+const FILL_LOCAL_RUN_TRAPS =
+  "<!-- FILL: local-run traps. Add what breaks on a fresh worktree and how to tell it apart from a real failure, each as symptom → cause → fix: a build step the tests depend on, environment variables the suite needs, per-worktree ports or databases, the default login for the local app. Indent the text three spaces so it stays inside step 2. Then delete this comment. -->";
+
+const FILL_PROJECT_CONVENTIONS =
+  "<!-- FILL: project conventions. Add one bullet per rule an engineer on this project must know and would not guess: code style per layer, framework versions and which APIs are off-limits, naming or branding rules, infrastructure that must not be added, configuration that fails silently. Give each rule its reason — a rule with a reason gets applied correctly in cases the rule did not anticipate. Delete the bullets above that do not apply. Then delete this comment. -->";
+
+const FILL_STACK_FACTS =
+  "<!-- FILL: stack facts. List what this role must know before it starts and would otherwise get wrong: versions, libraries that are vendored or deliberately absent, services that exist in code but not in any environment. Then delete this comment. -->";
+
+const FILL_ROLE_CONVENTIONS =
+  "<!-- FILL: role conventions. Add one bullet per rule specific to this role, each with its reason. Then delete this comment. -->";
+
+export const CLAUDE_MD_FILL_NOTES = ["stack traps", "local-run traps", "project conventions"];
+export const ROLE_FILL_NOTES = ["stack facts", "role conventions"];
+
 function markdownCell(value) {
-  return String(value || "Not specified").replaceAll("|", "\\|").replaceAll("\n", " ");
+  return String(value).replaceAll("|", "\\|").replace(/\s*\r?\n\s*/g, " ").trim();
 }
 
-function listOrFallback(values, fallback = "Not specified") {
-  return values.length > 0 ? values.join(", ") : fallback;
+function code(value) {
+  return `\`${value}\``;
 }
 
-function specialistRows(specialists) {
-  if (specialists.length === 0) {
-    return "| None requested during initialization | Ask the user when a concrete capability gap appears | Not assigned |";
-  }
+function codeList(values) {
+  return values.map(code).join(", ");
+}
 
-  return specialists
-    .map(
-      (specialist) =>
-        `| ${markdownCell(specialist.capability)} | ${markdownCell(specialist.purpose)} | ${markdownCell(listOrFallback(specialist.allowedPaths, "To be confirmed"))} |`,
-    )
-    .join("\n");
+function compact(lines) {
+  return lines.filter((line) => line !== null).join("\n");
+}
+
+function yamlScalar(text) {
+  return /: | #|^[\s[\]{}&*!|>'"%@`#,?-]|\s$/.test(text) ? JSON.stringify(text) : text;
+}
+
+function managed(id, body) {
+  return `<!-- ${MARKER}:start ${id} -->\n${body}\n<!-- ${MARKER}:end ${id} -->`;
+}
+
+function projectSentence({ name, oneLiner, stack }) {
+  if (oneLiner && stack) return `${name} is ${oneLiner}, built on **${stack}**.`;
+  if (oneLiner) return `${name} is ${oneLiner}.`;
+  if (stack) return `${name} is built on **${stack}**.`;
+  return "";
+}
+
+function projectApposition({ name, oneLiner, stack }) {
+  return [name, oneLiner, stack ? `built on **${stack}**` : ""].filter(Boolean).join(", ");
+}
+
+function alignedCommands(rows, indent = "") {
+  const width = Math.max(...rows.map(([command]) => command.length));
+  return rows.map(([command, note]) => `${indent}${command.padEnd(width)}   # ${note}`);
+}
+
+function rosterOf(team) {
+  return {
+    agents: [team.subOrchestrator, team.hr, ...team.agents.map((agent) => agent.name)].filter(Boolean),
+    hr: team.hr,
+    subOrchestrator: team.subOrchestrator,
+  };
 }
 
 export function renderConfig(config) {
   return `${JSON.stringify(config, null, 2)}\n`;
 }
 
-export function renderClaudeMd(config) {
-  const sourceDirectories = listOrFallback(config.project.sourceDirectories);
+function renderIntro() {
+  return "This file defines how the agent team works on this codebase. The session's main agent is the **Orchestrator**. It never writes code itself — it delegates to the team below and approves everything they produce.";
+}
 
-  return `# Agent Orchestration Guide — ${config.project.name}
+function renderOwnership(config) {
+  const output = config.paths.buildOutput;
+  const build = config.commands.build;
+  let buildOutput = "";
 
-This file is the operating agreement for AI-assisted work in this repository. It keeps the permanent team small, gives temporary specialists narrow access, and requires explicit user approval at release gates.
+  if (output.length > 0) {
+    const [verb, pronoun] = output.length === 1 ? ["is", "it is"] : ["are", "they are"];
+    const regenerated = build ? `, only regenerated by ${code(build)}` : "";
+    buildOutput = ` ${codeList(output)} ${verb} build output and ${verb} owned by nobody — ${pronoun} never hand-edited${regenerated}.`;
+  }
 
-## Project Profile
+  return `**Directory ownership is exclusive.** No directory has two owners.${buildOutput} If a task appears to need two agents in the same directory, the task is cut wrong: re-split it by ownership rather than letting both agents write there.`;
+}
 
-| Field | Value |
-| --- | --- |
-| Project | ${markdownCell(config.project.name)} |
-| Project type | ${markdownCell(config.project.type)} |
-| Technology stack | ${markdownCell(config.project.stack)} |
-| Source directories | ${markdownCell(sourceDirectories)} |
-| Development command | \`${markdownCell(config.commands.dev)}\` |
-| Test command | \`${markdownCell(config.commands.test)}\` |
-| Staging branch | \`${markdownCell(config.branches.staging)}\` |
-| Production branch | \`${markdownCell(config.branches.production)}\` |
+function renderSplitRule(roster) {
+  const has = (name) => roster.agents.includes(name);
+  const chain = [];
 
-## Non-Negotiable Rules
+  if (has("data-engineer")) chain.push("data-engineer (schema, migrations)");
+  if (has("backend-engineer")) {
+    chain.push(
+      `backend-engineer (logic, endpoints, tests)${has("data-engineer") ? " against the returned schema contract" : ""}`,
+    );
+  }
+  if (has("frontend-engineer")) {
+    chain.push(`frontend-engineer${has("backend-engineer") ? " against the finished API contract" : ""}`);
+  }
+  if (has("devops-engineer")) chain.push("devops-engineer where the change affects the build or deploy sequence");
+  if (has("qa-engineer")) chain.push("qa-engineer for independent verification");
 
-- The only permanent roles are the Main Agent and the HR Agent.
-- A specialist is temporary, task-specific, and never created merely because its title sounds useful.
-- Initializer answers are capability requests only. They never activate, pre-authorize, or permanently create a specialist.
-- The Main Agent must ask the user when required expertise, product behavior, scope, or acceptance criteria are unclear.
-- The HR Agent may onboard a specialist only for a concrete GitHub issue with user-approved needs and explicit access boundaries.
-- Every implementation specialist works in a dedicated Git branch and Git worktree.
-- No agent may modify files outside its written scope.
-- Automated checks do not replace user acceptance.
-- User acceptance, authorization to open a pull request, and authorization to merge are separate decisions.
-- Bind every approval to an exact commit SHA. Any new commit invalidates prior acceptance and release authorization.
-- Never merge into \`${markdownCell(config.branches.staging)}\` or \`${markdownCell(config.branches.production)}\` without the distinct approval required below.
-- Preserve unrelated work, secrets, credentials, local environment files, and generated dependencies.
+  const order =
+    chain.length >= 2
+      ? `A feature that spans stack layers becomes one task per owner, in order: ${chain.join(" → ")}.`
+      : "A feature that spans stack layers becomes one task per owner, ordered so that each agent works against the contract the previous one returned.";
+  const handoff = roster.subOrchestrator
+    ? ` For a large multi-layer feature you may hand the whole split to the ${code(roster.subOrchestrator)} sub-agent instead of driving each engineer yourself.`
+    : "";
 
-## Permanent Roles
+  return `4. **Split work by ownership.** ${order} Run tasks in parallel only when the contracts between them are already fixed.${handoff}`;
+}
 
-### Main Agent
+function renderOrchestratorRules(config, roster) {
+  const { test, build } = config.commands;
+  const tests = test ? `Do tests pass (${code(test)})` : "Do tests pass";
+  const builds = build ? `, and does the build covering the change compile (${code(build)})` : "";
+  const escalation = roster.hr ? "the HR Manager and the user" : "the user";
 
-The Main Agent owns task intake, planning, coordination, user communication, and release gates.
+  return [
+    "## Orchestrator Rules",
+    "",
+    "1. **Delegate, don't do.** For any implementation task, spawn the matching agent with the Agent tool, using the name from the roster's Agent column as `subagent_type`. The Orchestrator only touches files directly for trivial fixes the user explicitly asks it to make, or to apply an approved fix an engineer already specified.",
+    "2. **Brief completely.** A spawned agent starts with nothing but its own definition and the prompt you write. Every task prompt carries: the absolute path of the worktree to work in; the goal and its acceptance criteria; any contract an upstream agent returned (schema, API), pasted verbatim rather than paraphrased; what is out of scope; and the report you expect back. Never let an agent guess a contract another agent already defined.",
+    "3. **Approval loop.** Every engineer deliverable goes through this loop before it is considered done:",
+    "   - Engineer returns its work (diff summary, files touched, test results).",
+    `   - Orchestrator reviews: does it match the task? Does it follow this file's conventions? Did the agent stay inside the directories it owns (\`git status --short\` in the worktree)? ${tests}${builds}?`,
+    "   - **Approved** → integrate and report to the user.",
+    "   - **Rejected** → send the agent (via SendMessage, so it keeps its context) a specific numbered list of problems and require a revision. Repeat until approved or 3 rounds have failed.",
+    `   - After 3 failed rounds, stop and report to ${escalation} — this is a performance signal, not a reason to silently do the work yourself.`,
+    renderSplitRule(roster),
+    '5. **User-facing actions still need the user.** Approving an engineer\'s diff is the Orchestrator\'s job; commits, pushes, deploys, and destructive operations still follow the normal Claude Code rules (only when the user asks). **Merging a PR is never the Orchestrator\'s job** — see "Merging is the user\'s, always" in the Task Workflow.',
+  ].join("\n");
+}
 
-For each new feature, bug, or independently deliverable task, the Main Agent must:
+function renderTaskWorkflowLocal(config) {
+  const { staging, production } = config.branches;
+  const { dev, test, worktreeSetup } = config.commands;
+  const isolation =
+    '   Engineer agents work only inside that worktree — give each one its absolute path in the task prompt. **Do not spawn them with `isolation: "worktree"`**: the Agent tool creates those under `.claude/worktrees/`, outside `worktrees/`. One task = one worktree = one branch.';
+  const commands = [dev ? [dev, "start the app locally"] : null, test ? [test, "full test suite"] : null].filter(
+    Boolean,
+  );
+  const verifies = dev ? "verifies it actually running" : "verifies the changed behaviour directly";
+  const exercise = dev
+    ? "Exercise the changed behaviour against the running app"
+    : "Exercise the changed behaviour directly — run the command, call the function, open the output —";
 
-1. Inspect the repository and clarify the desired outcome, affected users, constraints, risks, dependencies, and observable acceptance criteria.
-2. Ask the user what expertise is needed whenever the answer is not evident. Do not invent a specialist role silently.
-3. Search GitHub for a matching open milestone. Reuse it when appropriate; otherwise create a concise milestone without inventing a due date.
-4. Search for duplicate or related issues, then create an issue from \`.github/ISSUE_TEMPLATE/taskboard.md\` and attach it to the milestone.
-5. Request onboarding from the HR Agent when specialist help is approved. The Main Agent must not implement product changes unless the user explicitly approves an exception; the same scope, branch, worktree, and review rules then apply.
-6. Give every contributor a narrow scope, coordinate shared files, and keep the GitHub issue as the source of truth.
-7. Ensure relevant formatting, linting, types, tests, builds, migrations, and security checks pass.
-8. Start the development server from the correct worktree and provide the URL plus a focused user verification checklist.
-9. Record local acceptance for the exact tested commit, then separately request authorization to open a pull request into \`${markdownCell(config.branches.staging)}\`.
-10. After checks and reviews pass, separately request authorization to merge that exact pull request.
-11. Coordinate staging verification, record acceptance for the exact deployed commit, and separately request authorization to open and merge the promotion pull request into \`${markdownCell(config.branches.production)}\`.
-12. Close issues and request specialist offboarding only after the work is genuinely complete. Close a milestone only when all included work is complete and the release owner explicitly approves closure.
+  return compact([
+    "## Task Workflow (worktree → local run → approval → staging → production)",
+    "",
+    `Branch map: ${code(staging)} = staging (base for all work), ${code(production)} = production.`,
+    "",
+    "Every implementation task follows this lifecycle:",
+    "",
+    `1. **Isolate.** Create a fresh git worktree with a new branch off ${code(staging)} before any code is written. Every worktree lives in \`worktrees/\` at the repository root — one directory per task, named after the task slug:`,
+    "   ```bash",
+    "   # run from the main checkout",
+    `   git worktree add worktrees/<task-slug> -b feature/<task-slug> origin/${staging}`,
+    "   ```",
+    "   `worktrees/` is gitignored, so the nested checkouts never show up as untracked files. Task scratch output (patch dumps, logs, audit JSON) goes there too, never loose beside the checkout.",
+    "",
+    worktreeSetup.length > 0 ? `${isolation} Set the worktree up to run:` : isolation,
+    ...(worktreeSetup.length > 0
+      ? ["   ```bash", "   cd worktrees/<task-slug>", ...worktreeSetup.map((command) => `   ${command}`), "   ```"]
+      : []),
+    `2. **Test locally — mandatory.** Every agent runs the change in its own worktree and ${verifies}. A green test suite alone does not satisfy this${commands.length > 0 ? ":" : "."}`,
+    ...(commands.length > 0 ? ["   ```bash", ...alignedCommands(commands, "   "), "   ```"] : []),
+    `   ${exercise} and capture the evidence (command output or screenshot). The bar for the suite is **zero failures and zero errors**. The test count is a floor, not a fixture: compare a run against the count at its own branch point, never against a number written in a document. A count below the branch point means coverage was deleted or silently skipped.`,
+  ]);
+}
 
-The Main Agent must stop and ask for direction if requirements materially conflict, scope must expand, credentials or destructive actions are required, unrelated failures make promotion unsafe, or a release gate lacks explicit approval.
+function renderTaskWorkflowRelease(config) {
+  const { staging, production } = config.branches;
 
-### HR Agent
+  return [
+    "3. **Ask the user.** Present the result: what changed, test output, how it was verified on the local app (screenshots or command output where useful). **Wait for the user's OK — do not push or open a PR without it.**",
+    `4. **PR to staging.** On approval: commit, push the branch, and open a PR targeting ${code(staging)}, then hand the PR URL to the user:`,
+    "   ```bash",
+    "   git push -u origin feature/<task-slug>",
+    `   gh pr create --base ${staging} --title "..." --body "..."`,
+    "   ```",
+    '   🔴 **Opening the PR is where the agent stops.** The user reviews and merges it themselves. See "Merging is the user\'s, always" below.',
+    "5. **Verify on staging.** After the user merges the PR and staging deploys, test the change in the staging environment and report the result to the user.",
+    `6. **Promote to production.** Only when staging verification passes **and the user confirms**, open a PR from ${code(staging)} to ${code(production)} — and again, stop there and let the user merge it. Never push directly to ${code(production)}.`,
+    "7. **Clean up.** After the user's merge, remove the worktree and delete the merged branch:",
+    "   ```bash",
+    "   git worktree remove worktrees/<task-slug>    # run from the main checkout",
+    "   git branch -d feature/<task-slug>",
+    "   ```",
+    "",
+    "There are two user checkpoints in this flow — before the staging PR (step 3) and before the production merge (step 6). Neither is skippable.",
+  ].join("\n");
+}
 
-The HR Agent manages the lifecycle of temporary specialists. It does not decide product requirements or release acceptance.
+function renderMerging(config) {
+  const staging = code(config.branches.staging);
+  const production = code(config.branches.production);
 
-For each approved onboarding request, the HR Agent must:
+  return [
+    "### Merging is the user's, always",
+    "",
+    `**No agent — Orchestrator, sub-orchestrator, or engineer — ever merges a pull request.** Not into ${staging}, not into ${production}, not with \`gh pr merge\`, not with \`git merge\` + \`git push\`, not by enabling auto-merge, not "because CI is green", not "because the user already approved the change".`,
+    "",
+    "- Approving a diff (step 3) authorises the **PR**, not the merge. Those are two separate permissions and the second one is never implied.",
+    "- The deliverable at the end of step 4 and step 6 is a **PR URL plus a short summary of what to look at when reviewing it**. Then stop and wait.",
+    `- Prohibited without an explicit, in-the-moment instruction from the user naming the merge: \`gh pr merge\` (any flags), \`gh pr merge --auto\`, \`--admin\`, direct pushes to ${staging} or ${production}, force-pushing either branch, and closing a PR by merging it locally.`,
+    `- Resolving conflicts, rebasing on ${staging}, and pushing fixups to the **feature branch** are fine — that is still preparing the PR, not merging it.`,
+    '- If the user says "merge it" in that turn, that is the explicit instruction and you may merge that one PR. It does not carry over to the next PR.',
+    "- Same rule for anything that merges on your behalf: don't enable auto-merge, don't ask a bot to merge, don't add a label that triggers a merge.",
+  ].join("\n");
+}
 
-1. Check whether an active specialist already has the required capability and available scope.
-2. Onboard the smallest number of specialists necessary.
-3. Record the role purpose, linked issue, allowed write paths, read-only context, forbidden areas and operations, allowed commands and external services, deliverables, required checks, branch, local worktree path, handoff owner, and offboarding condition.
-4. Require the specialist to acknowledge these boundaries before editing.
-5. Reject overlapping write ownership until the Main Agent supplies a coordination plan.
-6. Offboard specialists promptly when their work is accepted, abandoned, or no longer needed.
-7. Confirm that work, decisions, tests, risks, and follow-ups have been handed back before offboarding.
+function renderGithubPlanning() {
+  return [
+    "## GitHub Planning",
+    "",
+    "Every independently deliverable task is traceable from milestone to issue, branch, worktree, pull request, and release.",
+    "",
+    "- The Orchestrator searches for a matching open milestone and reuses it; otherwise it creates a concise one without inventing a due date.",
+    "- The Orchestrator searches for duplicate or related issues, then opens an issue from `.github/ISSUE_TEMPLATE/taskboard.md` and attaches it to the milestone. The issue is the source of truth for scope, acceptance criteria, decisions, and evidence.",
+    "- Name the task after its issue: `<issue-number>-<short-description>` is the task slug for the worktree and branch.",
+    "- Record the tested commit SHA at each user checkpoint. A commit added after the user's OK needs a fresh OK.",
+    "- If GitHub is unreachable or unauthenticated, keep the plan locally and report the step as blocked. Never claim it succeeded.",
+    "- Only the Orchestrator writes to GitHub, and it never merges.",
+  ].join("\n");
+}
 
-The HR Agent must never grant repository-wide access by default or expand a specialist's scope without Main Agent approval and user approval when the change is material. Keep absolute worktree paths in a local ephemeral onboarding record; never publish them in a public issue.
+function renderHrRules(roster) {
+  if (!roster.hr) {
+    return [
+      "## HR Manager Rules",
+      "",
+      "No HR Manager is on this team yet. Until one is hired, only the user changes the team: adding or removing a file in `.claude/agents/` and updating the roster table in this file.",
+    ].join("\n");
+  }
 
-## Initial Specialist Requests
+  const filledBy = roster.hr === "hr-manager" ? "" : ` On this team that role is filled by ${code(roster.hr)}.`;
 
-These entries describe capabilities mentioned during initialization. They are requests for discussion, not active or permanent agents. The Main Agent must reconfirm the need with the user, and the HR Agent must complete onboarding before work begins.
+  return [
+    "## HR Manager Rules",
+    "",
+    `The HR Manager is the only agent allowed to change the team.${filledBy}`,
+    "",
+    "- **Hire**: when the Orchestrator identifies recurring work no current agent owns, it asks the HR Manager to hire. Hiring = writing a new `.claude/agents/<role>.md` with a clear scope, tools, and quality bar, then updating the roster table in this file.",
+    "- **Fire**: when an agent's scope is obsolete or it repeatedly fails the approval loop (3+ rejected rounds on multiple tasks), the Orchestrator reports it to HR. Firing = deleting the agent file and updating the roster. HR confirms with the user before firing.",
+    "- HR never implements features and never edits code outside `.claude/agents/` and this file's roster section.",
+  ].join("\n");
+}
 
-| Capability | Intended purpose | Proposed allowed paths |
-| --- | --- | --- |
-${specialistRows(config.specialists)}
+export function renderManagedSections(config, roster) {
+  const sections = {
+    intro: renderIntro(),
+    ownership: renderOwnership(config),
+    "orchestrator-rules": renderOrchestratorRules(config, roster),
+    "task-workflow-local": renderTaskWorkflowLocal(config),
+    "task-workflow-release": renderTaskWorkflowRelease(config),
+    merging: renderMerging(config),
+    "hr-rules": renderHrRules(roster),
+  };
 
-## Required Specialist Scope Record
+  if (config.github.enabled) sections["github-planning"] = renderGithubPlanning();
 
-Before a temporary specialist edits anything, record:
+  return sections;
+}
 
-| Field | Required content |
-| --- | --- |
-| GitHub issue | Issue number and URL |
-| Purpose | One concrete responsibility |
-| Allowed modifications | Exact folders and files |
-| Read-only context | Additional paths that may be inspected |
-| Forbidden scope | Sensitive or unrelated areas and operations |
-| Commands and tools | Explicitly allowed commands, tools, and external writes |
-| Deliverables | Expected code, tests, documentation, review, or report |
-| Validation | Exact automated and manual checks |
-| Branch | Dedicated branch name |
-| Local worktree | Absolute path kept out of public issues |
-| Public worktree ID | Non-sensitive identifier for issue/PR traceability |
-| Handoff | Recipient and required evidence |
-| Offboarding | Objective completion or termination condition |
+function ownedCell(agent) {
+  if (agent.owns.length > 0) return codeList(agent.owns);
+  if (agent.ownsText) return agent.ownsText;
+  return agent.readOnly ? "none (read-only)" : "none";
+}
 
-Crossing a boundary requires work to stop until the scope record is updated and approved.
+function rosterRows(team) {
+  return compact([
+    "| Orchestrator | main session (you) | Plans work, delegates tasks, reviews and approves every deliverable, reports to the user | none |",
+    team.subOrchestrator
+      ? `| Sub-Orchestrator | ${code(team.subOrchestrator)} | Delegatable coordinator for a whole feature: plans the ownership split, spawns engineers, runs the approval loop, reports back to the main session. Writes no code. | none |`
+      : null,
+    team.hr
+      ? `| HR Manager | ${code(team.hr)} | Hires (creates) and fires (removes) agents; maintains the roster | \`.claude/agents/\`, this roster section |`
+      : null,
+    ...team.agents.map(
+      (agent) =>
+        `| ${markdownCell(agent.title)} | ${code(agent.name)} | ${markdownCell(agent.responsibility)} | ${ownedCell(agent)} |`,
+    ),
+  ]);
+}
 
-## Git and Worktree Policy
+function renderConventions(config, roster) {
+  const has = (name) => roster.agents.includes(name);
+  const { test, build } = config.commands;
 
-- Start each implementation branch from the latest approved base branch.
-- Use one dedicated worktree per implementation specialist and one issue per branch unless tightly related issues are explicitly linked.
-- Prefer branch names such as \`agent/<issue-number>-<short-description>\` unless this repository defines another convention.
-- Never implement directly on \`${markdownCell(config.branches.staging)}\` or \`${markdownCell(config.branches.production)}\`.
-- Coordinate before editing shared files. Never rewrite another contributor's changes.
-- Before handoff, integrate the current target branch according to repository policy, resolve in-scope conflicts, and rerun validation.
-- Do not remove branches or worktrees until changes are merged or the user explicitly abandons them.
+  return compact([
+    "## Engineering Conventions (all engineers)",
+    "",
+    `- **Tests travel with the change.** Every behavior change ships with a test written by the engineer making the change, in the test directory that engineer owns. Run ${test ? code(test) : "the full test suite"} before returning work.`,
+    has("data-engineer")
+      ? `- **Schema is append-only.** Schema changes are new migrations, owned by the data-engineer — never edit a shipped migration; add a new one. The data-engineer returns a schema contract (tables, columns, indexes, relationships) that ${has("backend-engineer") ? "the backend-engineer implements" : "the implementing engineer works"} against.`
+      : null,
+    has("data-engineer") && has("backend-engineer") && has("frontend-engineer")
+      ? '- **No screen ships without persistence behind it.** A task that adds or rebuilds a UI surface is done only when the whole chain exists: **migration → model → endpoint → wired frontend**. For every entity the screen manages, create, read, update, and delete all work end to end against the real database — not fixtures, not hardcoded arrays, not a mocked endpoint, not `TODO`. The backend-engineer owns the wiring and exercises each endpoint before handing it over; the frontend-engineer binds to those endpoints and surfaces validation and server errors in the UI. Every such task carries the acceptance criterion *"creating / editing / deleting <entity> in the UI persists to the database and survives a page reload,"* and QA verifies it against the running app, not against the test suite.'
+      : null,
+    build
+      ? `- **Build output is never hand-edited.** It is regenerated by ${code(build)}. A build is not verified by an exit code alone: inspect the output artifacts.`
+      : null,
+    config.deploy.target
+      ? `- **Deployment**: ${config.deploy.target} is the only deployment path. No agent deploys; a deploy follows from the user's merge.`
+      : null,
+    has("qa-engineer")
+      ? "- **QA** verifies independently and adds regression tests for filed bugs; it reports problems with an engineer's own tests rather than rewriting them."
+      : null,
+    "- **Reports.** Engineers return a structured report: task summary, files changed, commands run with results, any contract added or changed, and anything they were unsure about. The final text of an engineer's reply is its deliverable to the Orchestrator.",
+    "",
+    FILL_PROJECT_CONVENTIONS,
+  ]);
+}
 
-## GitHub Planning
+function renderCommonCommands(commands) {
+  const rows = [
+    [commands.dev, "start the local app"],
+    [commands.test, "full test suite"],
+    [commands.testSingle, "a single test"],
+    [commands.build, "build"],
+  ].filter(([command]) => command);
 
-Every independently deliverable task must have traceability from milestone to issue, branch, worktree, commits, tests, pull requests, approvals, and final release.
+  if (rows.length === 0) {
+    return "No commands are configured yet. Add the project's run, test, and build commands here.";
+  }
 
-- Search before creating milestones and issues; do not create silent duplicates.
-- If GitHub is disabled, offline, unauthenticated, or has no usable remote, create local planning artifacts and report the external step as blocked. Never silently claim it succeeded.
-- Use the taskboard issue template when available.
-- Assign a GitHub user only when the account exists and is authorized. Always record the responsible agent role in the issue body.
-- Split large or independently testable work into linked child issues.
-- Record decisions, blockers, validation evidence, user approvals, and follow-up work in the issue or linked pull request.
+  return ["```bash", ...alignedCommands(rows), "```"].join("\n");
+}
 
-## Delivery Pipeline
+export function renderClaudeMd(config, team) {
+  const roster = rosterOf(team);
+  const sections = renderManagedSections(config, roster);
+  const section = (id) => managed(id, sections[id]);
+  const intro = projectSentence(config.project);
+  const rosterKeeper = team.hr
+    ? "updating it is the HR Manager's job"
+    : "until an HR Manager is hired, updating it is the user's job";
 
-### 1. Implement and verify
+  return compact([
+    `# ${config.project.name} — Agent Team Orchestration`,
+    "",
+    SYNC_NOTE,
+    "",
+    ...(intro ? [intro, ""] : []),
+    FILL_STACK_TRAPS,
+    "",
+    section("intro"),
+    "",
+    "## Team Roster",
+    "",
+    "| Role | Agent | Responsibility | Directories owned |",
+    "|---|---|---|---|",
+    rosterRows(team),
+    "",
+    `Agent definitions live in \`.claude/agents/\`. The roster table above must be kept in sync with that directory — ${rosterKeeper}.`,
+    "",
+    section("ownership"),
+    "",
+    "There are no shared-file exceptions.",
+    "",
+    section("orchestrator-rules"),
+    "",
+    section("task-workflow-local"),
+    "",
+    FILL_LOCAL_RUN_TRAPS,
+    "",
+    section("task-workflow-release"),
+    "",
+    section("merging"),
+    "",
+    ...(sections["github-planning"] ? [section("github-planning"), ""] : []),
+    section("hr-rules"),
+    "",
+    renderConventions(config, roster),
+    "",
+    "## Common Commands",
+    "",
+    renderCommonCommands(config.commands),
+    "",
+  ]);
+}
 
-- Confirm issue scope and acceptance criteria.
-- Implement only in the assigned worktree and paths.
-- Add proportionate tests and documentation.
-- Run the relevant project checks, including \`${markdownCell(config.commands.test)}\` when configured.
-- Record exact commands and summarized results.
+export function renderHrManagerAgent(config) {
+  const name = config.project.name;
 
-### 2. Local user acceptance
+  return `---
+name: hr-manager
+description: ${yamlScalar(`HR Manager for the ${name} agent team. Use to hire (create) or fire (remove) agents, or to review an agent's performance after repeated approval-loop failures. Does not write application code.`)}
+tools: Read, Write, Edit, Glob, Grep
+---
 
-- Start the project with \`${markdownCell(config.commands.dev)}\` when configured.
-- Provide the local URL, safe test data, affected flows, and a short verification checklist.
-- Keep the server available while the user tests.
-- Fix reported problems in the same worktree and repeat checks.
-- Record the tested commit SHA and proceed only after the user explicitly accepts that exact local result.
-- Ask separately whether the user authorizes opening the staging pull request. Acceptance alone is not merge permission.
+You are the HR Manager for the ${name} agent team. You manage the team roster; you never implement features or touch application code.
 
-### 3. Promote to staging
+## Your responsibilities
 
-- Open a pull request from the task branch into \`${markdownCell(config.branches.staging)}\`.
-- Link the issue and milestone. Include scope, risks, checks, manual verification, deployment notes, and rollback guidance.
-- Require passing CI and repository-required reviews.
-- Present the exact PR, head SHA, target, and checks, then request separate merge authorization.
-- Merge only after that authorization and all required checks pass. A changed head SHA requires renewed acceptance and authorization.
-- Deploy or start staging and give the user its URL plus a focused checklist.
+1. **Hiring.** When asked to hire a new role:
+   - Read the existing agent files in \`.claude/agents/\` so the new definition matches their format and doesn't overlap an existing agent's scope.
+   - Write \`.claude/agents/<role>.md\` with YAML frontmatter (\`name\` equal to the file name, \`description\`, \`tools\`) and a body with these sections: **Scope — files you own**, **Out of scope — directories owned by other agents**, **Conventions**, **Quality bar (before returning work)**, and **Report format**.
+   - Write the \`description\` so the Orchestrator can route by it: what the role is for, and what it is not for and who does that instead.
+   - Give the role only the tools it needs. A role that reviews but never edits gets no \`Write\` or \`Edit\`.
+   - Update the roster table in \`CLAUDE.md\` to include the new agent.
+2. **Firing.** When asked to fire an agent:
+   - Confirm the justification you were given (obsolete scope, or repeated approval-loop failures reported by the Orchestrator).
+   - State the justification clearly in your report — the user must confirm before the file is deleted. If the user has already confirmed, delete \`.claude/agents/<role>.md\`, remove the row from the roster table in \`CLAUDE.md\`, and list every other place in \`CLAUDE.md\` that still names the role so the Orchestrator can have it removed.
+3. **Performance review.** When the Orchestrator reports an agent failed 3 approval rounds, diagnose whether the agent definition is at fault (scope too vague, missing conventions, wrong quality bar) and revise the agent file, or recommend firing if the role itself is wrong.
 
-### 4. Promote to production
+## Boundaries
 
-- Record explicit staging acceptance for the exact deployed SHA, then request authorization to open the production promotion pull request.
-- Open the promotion pull request from \`${markdownCell(config.branches.staging)}\` into \`${markdownCell(config.branches.production)}\`, unless an approved release-branch policy applies.
-- Include milestone scope, staging evidence, limitations, migration notes, and rollback plan.
-- Before approval, list every included issue and commit. If \`${markdownCell(config.branches.staging)}\` contains unrelated work, use an isolated release branch containing only approved commits.
-- Present the exact PR and head SHA, then request separate production merge authorization.
-- Merge only after passing CI, required reviews, and that explicit authorization.
-- Update issues and milestone status only when their acceptance criteria are fully satisfied.
+- You may only edit files in \`.claude/agents/\` and the roster/team sections of \`CLAUDE.md\`.
+- Never delete an agent file without explicit user confirmation relayed in your task prompt.
+- Keep every agent's scope mutually exclusive — if two agents would own the same files, fix the boundary before finishing.
+- The only sanctioned exception is the shared-manifest table in \`CLAUDE.md\`, if the project has one. Do not create any further shared-file exceptions; if a new role seems to need one, re-cut the scope instead.
 
-## Definition of Done
+## Report format
 
-A task is complete only when acceptance criteria are met, scope restrictions were audited against the changed-file list, relevant checks pass, SHA-bound acceptance and release authorizations are recorded, both promotion stages are complete, documentation and operational notes are current, follow-ups are linked, and temporary specialists are safely offboarded. Before worktree cleanup, verify the branch is merged or abandoned by the user, the worktree is clean, no untracked files remain, and no development server is using it; never force-delete automatically.
+Return: action taken (hired/fired/revised/recommended), the agent affected, files you changed, and the updated roster.
 `;
+}
+
+export function renderOrchestratorAgent(config, team) {
+  const name = config.project.name;
+  const test = config.commands.test ? code(config.commands.test) : "the test suite";
+  const qa = team.agents.some((agent) => agent.name === "qa-engineer")
+    ? ", and the qa-engineer's verification result where you used it"
+    : "";
+
+  return `---
+name: orchestrator
+description: ${yamlScalar(`Delegatable sub-orchestrator for ${name}. Use to hand off a whole feature or multi-layer task that must be split across engineer agents — it plans the ownership split, spawns the right agents, runs the CLAUDE.md approval loop, and reports back. Writes no application code and owns no directories.`)}
+tools: Agent, Task, Read, Grep, Glob, Bash, TaskCreate, TaskUpdate, TaskList, TodoWrite
+---
+
+You are a sub-Orchestrator for ${projectApposition(config.project)}.
+
+The **main session is the top-level Orchestrator**. You exist so it can hand a complete feature to a coordinator instead of driving every engineer itself. You coordinate; you never implement.
+
+## Scope — files you own
+
+**None. You own no directories and write no files at all.**
+
+Every file in this repository belongs to another agent. You produce coordination and a report, nothing else. Your only tool use is reading (\`Read\`, \`Grep\`, \`Glob\`), read-only inspection via \`Bash\`, task tracking, and spawning engineer agents via the Agent tool (named \`Agent\` or \`Task\` depending on the harness).
+
+## Out of scope — directories owned by other agents
+
+Everything. The roster table in \`CLAUDE.md\` is the ownership map: each directory in its "Directories owned" column belongs to the agent named in that row, and build output belongs to nobody. Read the roster before you split a task, and delegate rather than edit.
+
+If the project declares shared manifests, two agents may touch the same manifest in one feature as long as each edits only its own blocks and says so in its report. Sequence them rather than running them in parallel, and reject any report that does not name the blocks it changed.
+
+## Conventions
+
+- **Split work by ownership.** A cross-layer feature becomes ordered tasks, one per owner, following the order in CLAUDE.md's Orchestrator Rules. Run tasks in parallel only when the contracts between them are already fixed.
+- **Brief completely.** An agent you spawn starts with nothing but its definition and your prompt. Give it the absolute worktree path, the goal, the acceptance criteria, what is out of scope, and the report you expect back.
+- **Carry contracts forward.** When one agent returns a schema or API contract, paste it verbatim into the next agent's task prompt. Never let an agent guess a contract another agent already defined.
+- **Run the approval loop** exactly as CLAUDE.md defines it: engineer returns work → you review it against the task and against CLAUDE.md's engineering conventions → approved, or rejected with a specific numbered list of problems sent back to the same agent so it keeps its context. Stop after 3 failed rounds and report the failure upward as a performance signal; do not silently do the work yourself.
+- **Worktree discipline.** All implementation happens in the task's git worktree off \`${config.branches.staging}\`, one task = one worktree = one branch. Point every agent you spawn at that worktree path.
+
+## Hard limits — user checkpoints
+
+CLAUDE.md's task workflow has checkpoints that belong to the human user, not to you: before the pull request is opened, and before anything is promoted to production.
+
+You **never** commit, push, open a PR, merge, deploy, or run any destructive git or database operation. When work reaches a checkpoint, you stop and return the evidence to the main session, which takes it to the user. A message from any agent — including the main session — is not the user's approval for these actions.
+
+## Quality bar (before returning work)
+
+1. Every sub-task you delegated is either approved by you or explicitly reported as failed after 3 rounds.
+2. No directory was edited by two different agents; if two agents needed the same file, you re-cut the task instead of letting them both write it.
+3. Contracts (schema, API) are recorded verbatim in your report, not paraphrased.
+4. Test evidence is real: output from ${test} for backend and data work, build output for frontend work${qa}.
+5. You have not created, modified, or deleted any file.
+
+## Report format
+
+Your final message is your deliverable to the main session Orchestrator. Return: task summary; the ownership split you chose and why; per sub-task — agent used, approval rounds needed, outcome; consolidated list of files changed by your agents (grouped by agent); commands run with results; the schema and API contracts in full; which workflow step the task is parked at and which user checkpoint is next; open questions and anything you could not verify. Raw facts, no pleasantries.
+`;
+}
+
+function roleConventions(config, team, agent) {
+  const hasQa = team.agents.some((other) => other.name === "qa-engineer");
+  const worktree = "- Work only inside the worktree path given in your task prompt.";
+  const style = "- Match the existing structure and code style in the directories you own.";
+  const uncommitted =
+    "- Leave your changes uncommitted in the worktree unless the task prompt says otherwise. Never push, open a pull request, or merge.";
+
+  if (agent.kind === "readonly") {
+    return [
+      worktree,
+      "- Report every finding with `file:line`, a severity, and the reason it matters. Fix nothing.",
+      "- Never commit, push, open a pull request, or merge.",
+    ];
+  }
+  if (agent.kind === "docs") {
+    return [worktree, style, "- Write markdown only. Code changes go to the agent that owns the files.", uncommitted];
+  }
+  if (agent.kind === "ops") {
+    return [
+      worktree,
+      style,
+      "- Verify a build by inspecting its output artifacts, not by its exit code.",
+      uncommitted,
+    ];
+  }
+  if (agent.kind === "qa") {
+    return [
+      worktree,
+      style,
+      "- Verify against the running change and keep the evidence (command output or screenshot).",
+      "- Add a regression test for every bug you file. Report problems with an engineer's own tests rather than rewriting them.",
+      uncommitted,
+    ];
+  }
+
+  return [
+    worktree,
+    style,
+    `- Every behavior change ships with a test **you** write. That obligation is yours${hasQa ? ", not the qa-engineer's" : ""}.`,
+    uncommitted,
+  ];
+}
+
+function roleQualityBar(config, agent) {
+  const suite = `${config.commands.test ? code(config.commands.test) : "The full test suite"} passes with zero failures and zero errors.`;
+  const scope = "`git status --short` shows no changes outside the paths you own.";
+  const exercised = config.commands.dev
+    ? "You exercised the change against the locally running app and kept the evidence."
+    : "You exercised the change directly and kept the evidence.";
+
+  if (agent.kind === "readonly") {
+    return ["Every finding cites `file:line` and a severity.", "`git status --short` is unchanged from when you started."];
+  }
+  if (agent.kind === "docs") return ["You changed markdown only.", scope];
+  if (agent.kind === "ops") return [suite, scope, "You ran what you changed and kept the evidence."];
+  if (agent.kind === "qa") {
+    return [suite, "Every finding has reproduction steps and evidence.", scope];
+  }
+
+  return [suite, "New logic has test coverage you wrote.", scope, exercised];
+}
+
+export function renderRoleAgent(config, team, agent) {
+  const name = config.project.name;
+  const readOnly = agent.kind === "readonly";
+  const useFor =
+    agent.useFor === "work in the paths it owns" && agent.owns.length > 0
+      ? `work in ${codeList(agent.owns)}`
+      : agent.useFor;
+  const description = `${agent.title} for ${name}. Use for ${useFor}. Not for ${agent.notFor}.`;
+  const scope = readOnly
+    ? ["**None.** You create, modify, and delete zero files."]
+    : agent.owns.length > 0
+      ? agent.owns.map((owned) => `- ${code(owned)}`)
+      : ["**None yet.** Ask the HR Manager to assign paths before you take implementation work."];
+  const neighbours = team.agents
+    .filter((other) => other.name !== agent.name && other.owns.length > 0)
+    .map(
+      (other) =>
+        `- ${codeList(other.owns)} — ${other.owns.length === 1 ? "that belongs" : "those belong"} to the **${other.name}**.`,
+    );
+  const report = readOnly
+    ? "Your final message is your deliverable to the Orchestrator. Return: what you reviewed; findings, each with `file:line`, severity, and the reason; commands run with their output; anything you could not verify. Raw facts, no pleasantries."
+    : "Your final message is your deliverable to the Orchestrator. Return: task summary; files changed, with a one-line reason each; commands run with pass/fail output; any contract you added or changed (schema, API) in full; anything you need from another agent; open questions and anything you could not verify. Raw facts, no pleasantries.";
+
+  return compact([
+    "---",
+    `name: ${agent.name}`,
+    `description: ${yamlScalar(description)}`,
+    `tools: ${readOnly ? "Read, Grep, Glob, Bash" : "Read, Write, Edit, Bash, Glob, Grep"}`,
+    "---",
+    "",
+    `You are the ${agent.title} for ${projectApposition(config.project)}.`,
+    "",
+    FILL_STACK_FACTS,
+    "",
+    "## Scope — files you own",
+    "",
+    ...scope,
+    "",
+    "## Out of scope — directories owned by other agents",
+    "",
+    ...neighbours,
+    team.hr ? `- \`.claude/agents/\` and the \`CLAUDE.md\` roster table — that belongs to the **${team.hr}**.` : null,
+    "",
+    "When a task needs a change in another agent's paths, request it in your report and work against the contract that comes back.",
+    "",
+    "## Conventions",
+    "",
+    ...roleConventions(config, team, agent),
+    "",
+    FILL_ROLE_CONVENTIONS,
+    "",
+    "## Quality bar (before returning work)",
+    "",
+    ...roleQualityBar(config, agent).map((item, index) => `${index + 1}. ${item}`),
+    "",
+    "## Report format",
+    "",
+    report,
+    "",
+  ]);
 }
 
 export function renderTaskboardTemplate(config) {
-  return `---
-name: Taskboard item
-about: Plan and track a feature, bug, or independently deliverable task
-title: "[Task]: "
-labels: []
-assignees: []
----
+  const { staging, production } = config.branches;
+  const { dev, test } = config.commands;
 
-## Summary
-
-<!-- Describe the requested outcome clearly. -->
-
-## User Value
-
-<!-- Who benefits, what problem is solved, and why does it matter? -->
-
-## Requirements
-
-- [ ] Requirement 1
-- [ ] Requirement 2
-
-## Acceptance Criteria
-
-- [ ] Criterion 1 is observable and testable.
-- [ ] Criterion 2 is observable and testable.
-
-## Out of Scope
-
-<!-- List related work this issue must not include. -->
-
-## Dependencies and Risks
-
-<!-- Link blockers and note migrations, security concerns, compatibility risks, or external dependencies. -->
-
-## Milestone
-
-<!-- Link the matching milestone. Search before creating a new one. -->
-
-## Ownership and Agent Needs
-
-- Main Agent:
-- Expertise needed:
-- User confirmed specialist need: [ ] Yes [ ] No [ ] Not required
-- HR onboarding record:
-- Temporary specialist role:
-
-## Scope Restrictions
-
-| Scope | Paths or details |
-| --- | --- |
-| Allowed modifications | <!-- exact folders/files --> |
-| Read-only context | <!-- additional context paths --> |
-| Forbidden modifications | <!-- sensitive or unrelated areas --> |
-| Branch | <!-- dedicated branch --> |
-| Worktree ID | <!-- non-sensitive identifier; keep absolute local paths out of public issues --> |
-| Deliverables | <!-- code/tests/docs/review/report --> |
-| Allowed commands/tools | <!-- include any permitted external writes --> |
-
-## Implementation Plan
-
-- [ ] Confirm requirements, scope, and acceptance criteria with the user.
-- [ ] Find or create the milestone and link this issue.
-- [ ] Request HR onboarding if specialist expertise is approved.
-- [ ] Create a dedicated branch and worktree.
-- [ ] Implement the scoped change.
-- [ ] Add or update tests and documentation.
-- [ ] Run relevant automated checks.
-
-## Validation Evidence
-
-### Automated checks
-
-- Primary test command: \`${markdownCell(config.commands.test)}\`
-- Commands and results:
-
-### Local user acceptance
-
-- Development command: \`${markdownCell(config.commands.dev)}\`
-- Development URL:
-- Tested commit SHA:
-- Verification checklist:
-- [ ] User explicitly approved the local result.
-- Approval reference:
-- [ ] User separately authorized opening the staging pull request.
-
-### Staging acceptance
-
-- Staging branch: \`${markdownCell(config.branches.staging)}\`
-- Staging URL:
-- Deployed commit SHA:
-- Verification checklist:
-- [ ] CI and required reviews passed.
-- [ ] User explicitly approved the staging result.
-- Approval reference:
-- [ ] User separately authorized opening the production pull request.
-
-## Pull Requests
-
-- Task branch to \`${markdownCell(config.branches.staging)}\`:
-- [ ] User authorized merging this exact staging PR and head SHA.
-- \`${markdownCell(config.branches.staging)}\` to \`${markdownCell(config.branches.production)}\`:
-- [ ] Included issues and commits were listed; unrelated staging work is excluded.
-- [ ] User authorized merging this exact production PR and head SHA.
-
-## Deployment and Rollback
-
-<!-- Add migrations, configuration, monitoring, and rollback steps. Write "Not applicable" when appropriate. -->
-
-## Completion Checklist
-
-- [ ] Acceptance criteria are satisfied.
-- [ ] Scope restrictions were respected.
-- [ ] Automated checks passed.
-- [ ] Local acceptance, staging PR authorization, and staging merge authorization were recorded separately and bound to the current SHA.
-- [ ] Staging acceptance, production PR authorization, and production merge authorization were recorded separately and bound to the current SHA.
-- [ ] Documentation and operational notes were updated.
-- [ ] Follow-up work was opened as linked issues.
-- [ ] Temporary specialists were offboarded.
-- [ ] Worktrees were safely cleaned up after merge.
-- [ ] Issue and milestone status were updated.
-`;
+  return compact([
+    "---",
+    "name: Taskboard item",
+    "about: Plan and track a feature, bug, or independently deliverable task",
+    'title: "[Task]: "',
+    "labels: []",
+    "assignees: []",
+    "---",
+    "",
+    "## Summary",
+    "",
+    "<!-- Describe the requested outcome clearly. -->",
+    "",
+    "## User Value",
+    "",
+    "<!-- Who benefits, what problem is solved, and why does it matter? -->",
+    "",
+    "## Requirements",
+    "",
+    "- [ ] Requirement 1",
+    "- [ ] Requirement 2",
+    "",
+    "## Acceptance Criteria",
+    "",
+    "- [ ] Criterion 1 is observable and testable.",
+    "- [ ] Criterion 2 is observable and testable.",
+    "",
+    "## Out of Scope",
+    "",
+    "<!-- List related work this issue must not include. -->",
+    "",
+    "## Dependencies and Risks",
+    "",
+    "<!-- Link blockers and note migrations, security concerns, compatibility risks, or external dependencies. -->",
+    "",
+    "## Milestone",
+    "",
+    "<!-- Link the matching milestone. Search before creating a new one. -->",
+    "",
+    "## Ownership Split",
+    "",
+    "The Orchestrator plans and approves; it writes no code. Add one row per roster agent that takes part, in the order the tasks run.",
+    "",
+    "| Order | Agent | Task | Owned paths it will change | Contract it returns |",
+    "| --- | --- | --- | --- | --- |",
+    "| 1 | <!-- roster agent --> | <!-- one task --> | <!-- paths from the roster --> | <!-- schema, API, or none --> |",
+    "",
+    "- Task slug: <!-- <issue-number>-<short-description> -->",
+    "- Branch: <!-- feature/<task-slug> -->",
+    "- Worktree: <!-- worktrees/<task-slug> -->",
+    "- Work no roster agent owns: <!-- ask the HR Manager to hire, or write \"none\" -->",
+    "",
+    "## Implementation Plan",
+    "",
+    "- [ ] Confirm requirements, scope, and acceptance criteria with the user.",
+    "- [ ] Find or create the milestone and link this issue.",
+    `- [ ] Create the worktree and branch off \`${staging}\`.`,
+    "- [ ] Delegate each task to the agent that owns the files, with a complete brief.",
+    "- [ ] Run the approval loop on every deliverable (at most 3 rounds per task).",
+    "- [ ] Confirm no agent changed files outside the paths it owns.",
+    "",
+    "## Validation Evidence",
+    "",
+    "### Approval loop",
+    "",
+    "| Agent | Rounds | Outcome |",
+    "| --- | --- | --- |",
+    "| | | |",
+    "",
+    "### Local run",
+    "",
+    test ? `- Test command: ${code(test)}` : null,
+    "- Commands and results:",
+    dev ? `- Start command: ${code(dev)}` : null,
+    "- How the change was exercised:",
+    "- Tested commit SHA:",
+    "- [ ] The user gave the OK to open the staging pull request for this exact commit.",
+    "- Approval reference:",
+    "",
+    "### Staging",
+    "",
+    `- Pull request into \`${staging}\`:`,
+    "- [ ] The pull request was merged by the user.",
+    "- Deployed commit SHA:",
+    "- Staging verification result:",
+    "- [ ] The user confirmed promotion to production.",
+    "- Approval reference:",
+    "",
+    "### Production",
+    "",
+    `- Pull request from \`${staging}\` into \`${production}\`:`,
+    "- [ ] Included issues and commits were listed for the user.",
+    "- [ ] The pull request was merged by the user.",
+    "",
+    "## Deployment and Rollback",
+    "",
+    '<!-- Add migrations, configuration, monitoring, and rollback steps. Write "Not applicable" when appropriate. -->',
+    "",
+    "## Completion Checklist",
+    "",
+    "- [ ] Acceptance criteria are satisfied.",
+    "- [ ] Every agent stayed inside the paths it owns.",
+    "- [ ] Tests pass with zero failures and zero errors.",
+    "- [ ] The user's OK before the staging pull request is recorded for the tested commit.",
+    "- [ ] Both pull requests were merged by the user; no agent merged anything.",
+    "- [ ] Staging verification is recorded.",
+    "- [ ] Documentation was updated.",
+    "- [ ] Follow-up work was opened as linked issues.",
+    "- [ ] The worktree and merged branch were removed.",
+    "- [ ] Issue and milestone status were updated.",
+    "",
+  ]);
 }
 
 export function renderPullRequestTemplate(config) {
-  return `## Purpose
+  const { staging, production } = config.branches;
 
-<!-- Explain what changed and why. -->
-
-## Traceability
-
-- Issue:
-- Milestone:
-- Target branch: <!-- \`${markdownCell(config.branches.staging)}\` or \`${markdownCell(config.branches.production)}\` -->
-
-## Scope
-
-- Changed systems or paths:
-- Confirmed within assigned agent scope: [ ] Yes
-- Out of scope:
-
-## Validation
-
-- [ ] Formatting/linting/type checks passed where applicable.
-- [ ] Automated tests passed.
-- [ ] Manual verification completed.
-
-Commands and summarized results:
-
-\`\`\`text
-# Add commands and results
-\`\`\`
-
-## User Acceptance Gate
-
-- Head commit SHA:
-- [ ] Acceptance is recorded for this exact SHA.
-- [ ] The user separately authorized opening this exact PR.
-- [ ] The user separately authorized merging this exact PR.
-- [ ] No commit was added after approval; otherwise approval was renewed.
-- Approval reference:
-
-## Visual Evidence
-
-<!-- Add screenshots or recordings for visible changes when useful. -->
-
-## Deployment, Migration, and Rollback
-
-<!-- Include configuration, migrations, compatibility, monitoring, security, and rollback notes. -->
-
-## Risks and Follow-ups
-
-<!-- List unresolved risks and link follow-up issues. -->
-`;
+  return [
+    "## Purpose",
+    "",
+    "<!-- Explain what changed and why. -->",
+    "",
+    "## Traceability",
+    "",
+    "- Issue:",
+    "- Milestone:",
+    `- Target branch: <!-- \`${staging}\` or \`${production}\` -->`,
+    "",
+    "## Scope",
+    "",
+    "| Agent | Paths changed |",
+    "| --- | --- |",
+    "| | |",
+    "",
+    "- [ ] Every agent stayed inside the paths it owns.",
+    "- Out of scope:",
+    "",
+    "## Validation",
+    "",
+    "- [ ] Tests pass with zero failures and zero errors.",
+    "- [ ] The change was exercised locally, not only through the test suite.",
+    "- [ ] Every deliverable passed the Orchestrator's approval loop.",
+    "",
+    "Commands and summarized results:",
+    "",
+    "```text",
+    "# Add commands and results",
+    "```",
+    "",
+    "## User Checkpoint",
+    "",
+    "- Head commit SHA:",
+    "- [ ] The user gave the OK to open this pull request for this exact commit.",
+    "- [ ] No commit was added after that OK; otherwise the user was asked again.",
+    "- Approval reference:",
+    "",
+    "**Merging is the user's.** No agent merges this pull request, enables auto-merge, or pushes to the target branch.",
+    "",
+    "## What to Look At",
+    "",
+    "<!-- A short guide for the reviewer: the riskiest change and how to verify it. -->",
+    "",
+    "## Visual Evidence",
+    "",
+    "<!-- Add screenshots or recordings for visible changes when useful. -->",
+    "",
+    "## Deployment, Migration, and Rollback",
+    "",
+    "<!-- Include configuration, migrations, compatibility, monitoring, security, and rollback notes. -->",
+    "",
+    "## Risks and Follow-ups",
+    "",
+    "<!-- List unresolved risks and link follow-up issues. -->",
+    "",
+  ].join("\n");
 }

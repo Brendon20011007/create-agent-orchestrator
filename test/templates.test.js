@@ -1,46 +1,192 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { renderClaudeMd, renderTaskboardTemplate } from "../src/templates.js";
+import { normalizeConfig } from "../src/config.js";
+import { resolveTeam } from "../src/team.js";
+import {
+  MANAGED_SECTION_IDS,
+  renderClaudeMd,
+  renderHrManagerAgent,
+  renderOrchestratorAgent,
+  renderPullRequestTemplate,
+  renderRoleAgent,
+  renderTaskboardTemplate,
+} from "../src/templates.js";
 
-const config = {
-  schemaVersion: 1,
-  project: {
-    name: "Payments | Portal",
-    type: "Web application",
-    stack: "Node.js",
-    sourceDirectories: ["frontend", "backend"],
-  },
-  commands: { dev: "npm run dev", test: "npm test" },
-  branches: { staging: "staging", production: "main" },
-  github: { enabled: true, milestonePolicy: "create-if-missing" },
-  orchestration: {
-    onboardingApproval: "per-task",
-    mainMayImplement: false,
-    maxConcurrentSpecialists: 3,
-  },
-  approvals: {
-    bindToCommit: true,
-    invalidateOnNewCommit: true,
-    requirePrOpenAuthorization: true,
-    requireMergeAuthorization: true,
-  },
-  permanentRoles: ["Main Agent", "HR Agent"],
-  specialists: [],
-};
+const REQUIRED_HEADINGS = [
+  "## Team Roster",
+  "## Orchestrator Rules",
+  "## Task Workflow",
+  "### Merging is the user's, always",
+  "## HR Manager Rules",
+  "## Engineering Conventions",
+  "## Common Commands",
+];
+const REQUIRED_RULES = [
+  "It never writes code itself",
+  "Delegate, don't do",
+  "Approval loop",
+  "Directory ownership is exclusive",
+];
+const PLACEHOLDER = /\{\{[A-Z][A-Z0-9_]*\}\}/;
 
-test("renderClaudeMd customizes project fields and keeps specialists dynamic", () => {
-  const output = renderClaudeMd(config);
-  assert.match(output, /Payments \\| Portal/);
-  assert.match(output, /None requested during initialization/);
-  assert.match(output, /temporary, task-specific/);
-  assert.doesNotMatch(output, /### Frontend Agent/);
+function config(overrides = {}) {
+  return normalizeConfig({
+    project: { name: "Payments | Portal", oneLiner: "a billing dashboard", stack: "Node.js 22" },
+    commands: { dev: "npm run dev", test: "npm test", build: "npm run build", worktreeSetup: ["npm install"] },
+    branches: { staging: "staging", production: "main" },
+    paths: { buildOutput: ["dist/"] },
+    deploy: { target: "a container platform" },
+    ...overrides,
+  });
+}
+
+function team(agents) {
+  return resolveTeam(agents, [], { addFixed: true });
+}
+
+const fullTeam = team([
+  { name: "software-architect", owns: ["docs/"] },
+  { name: "data-engineer", owns: ["db/"] },
+  { name: "backend-engineer", owns: ["src/", "test/"] },
+  { name: "frontend-engineer", owns: ["web/"] },
+  { name: "devops-engineer", owns: ["deploy/"] },
+  { name: "qa-engineer", owns: ["e2e/"] },
+  { name: "auditor", owns: [] },
+]);
+
+test("renderClaudeMd produces the roster structure the template checker looks for", () => {
+  const output = renderClaudeMd(config(), fullTeam);
+
+  for (const heading of REQUIRED_HEADINGS) {
+    assert.ok(output.split("\n").some((line) => line.startsWith(heading)), `missing heading: ${heading}`);
+  }
+  for (const rule of REQUIRED_RULES) assert.ok(output.includes(rule), `missing rule: ${rule}`);
+
+  assert.match(output, /^# Payments \| Portal — Agent Team Orchestration$/m);
+  assert.match(output, /Payments \| Portal is a billing dashboard, built on \*\*Node\.js 22\*\*\./);
+  assert.match(output, /^\| Orchestrator \| main session \(you\) \|/m);
+  assert.match(output, /^\| Sub-Orchestrator \| `orchestrator` \|/m);
+  assert.match(output, /^\| HR Manager \| `hr-manager` \|.*\| `\.claude\/agents\/`, this roster section \|$/m);
+  assert.match(output, /^\| Backend Engineer \| `backend-engineer` \|.*\| `src\/`, `test\/` \|$/m);
+  assert.match(output, /^\| Auditor \| `auditor` \|.*\| none \(read-only\) \|$/m);
+  assert.match(output, /data-engineer \(schema, migrations\) → backend-engineer .* → qa-engineer for independent verification/);
+  assert.match(output, /There are no shared-file exceptions\./);
+  assert.doesNotMatch(output, PLACEHOLDER);
+  assert.doesNotMatch(output, /Main Agent|temporary specialist|<!-- OPTIONAL/);
+  assert.equal(output.match(/<!-- FILL:/g).length, 3);
 });
 
-test("renderTaskboardTemplate includes both user approval gates", () => {
-  const output = renderTaskboardTemplate(config);
-  assert.match(output, /User explicitly approved the local result/);
-  assert.match(output, /User explicitly approved the staging result/);
-  assert.match(output, /staging.*main/s);
-  assert.match(output, /Tested commit SHA/);
-  assert.match(output, /authorized merging this exact production PR/);
+test("renderClaudeMd wraps every managed section in one pair of markers", () => {
+  const output = renderClaudeMd(config(), fullTeam);
+
+  for (const id of MANAGED_SECTION_IDS) {
+    assert.equal(output.split(`<!-- agent-orchestrator:start ${id} -->`).length, 2, `start marker for ${id}`);
+    assert.equal(output.split(`<!-- agent-orchestrator:end ${id} -->`).length, 2, `end marker for ${id}`);
+  }
+
+  const withoutGithub = renderClaudeMd(config({ github: { enabled: false } }), fullTeam);
+  assert.doesNotMatch(withoutGithub, /GitHub Planning|github-planning/);
+});
+
+test("renderClaudeMd mentions a starter role only when it is on the roster", () => {
+  const output = renderClaudeMd(
+    config(),
+    team([
+      { name: "backend-engineer", owns: ["src/"] },
+      { name: "auditor", owns: [] },
+    ]),
+  );
+
+  for (const absent of ["data-engineer", "frontend-engineer", "devops-engineer", "qa-engineer", "software-architect"]) {
+    assert.ok(!output.includes(absent), `off-roster role mentioned: ${absent}`);
+  }
+  assert.match(output, /ordered so that each agent works against the contract the previous one returned/);
+  assert.doesNotMatch(output, /No screen ships without persistence|Schema is append-only|\*\*QA\*\* verifies/);
+});
+
+test("renderClaudeMd omits text that depends on an unset value", () => {
+  const output = renderClaudeMd(
+    normalizeConfig({ project: { name: "Example" }, commands: { dev: "none", test: "Not applicable" } }),
+    team([]),
+  );
+
+  assert.doesNotMatch(output, /Not applicable|`none`|(?<!`)``(?!`)|regenerated by|build output|Deployment|undefined/);
+  assert.doesNotMatch(output, /Example is/);
+  assert.match(output, /verifies the changed behaviour directly\. A green test suite alone does not satisfy this\./);
+  assert.match(output, /Do tests pass\?/);
+  assert.match(output, /Run the full test suite before returning work\./);
+  assert.match(output, /No commands are configured yet\./);
+  assert.doesNotMatch(output, /Set the worktree up to run/);
+});
+
+test("renderClaudeMd leaves out a fixed role the team does not have", () => {
+  const adopted = resolveTeam([], [{ file: "frontend.md", name: "frontend", description: "Builds the UI.", owns: [] }], {
+    addFixed: false,
+  });
+  const output = renderClaudeMd(config(), adopted);
+
+  assert.doesNotMatch(output, /hr-manager|`orchestrator`|Sub-Orchestrator \|/);
+  assert.match(output, /^\| Frontend \| `frontend` \| Builds the UI\. \| Defined in its agent file \|$/m);
+  assert.match(output, /No HR Manager is on this team yet\./);
+  assert.match(output, /stop and report to the user —/);
+});
+
+test("renderClaudeMd names the agent that fills the HR role under another name", () => {
+  const adopted = resolveTeam([], [{ file: "hr-agent.md", name: "hr-agent", description: "Manages the team.", owns: [] }], {
+    addFixed: false,
+  });
+  const output = renderClaudeMd(config(), adopted);
+
+  assert.match(output, /^\| HR Manager \| `hr-agent` \|/m);
+  assert.match(output, /On this team that role is filled by `hr-agent`\./);
+  assert.equal(output.match(/`hr-agent`/g).length, 2);
+});
+
+test("GitHub templates describe roster agents and leave merging to the user", () => {
+  const taskboard = renderTaskboardTemplate(config());
+  const pullRequest = renderPullRequestTemplate(config());
+
+  assert.match(taskboard, /The Orchestrator plans and approves; it writes no code\./);
+  assert.match(taskboard, /Tested commit SHA/);
+  assert.match(taskboard, /The user gave the OK to open the staging pull request for this exact commit\./);
+  assert.equal(taskboard.match(/The pull request was merged by the user\./g).length, 2);
+  assert.match(taskboard, /Pull request from `staging` into `main`/);
+  assert.match(pullRequest, /No agent merges this pull request/);
+
+  for (const output of [taskboard, pullRequest]) {
+    assert.doesNotMatch(output, /Main Agent|HR onboarding|specialist|authorized merging/i);
+  }
+});
+
+test("agent files carry matching frontmatter and no placeholders", () => {
+  const settings = config();
+  const files = [
+    ["hr-manager", renderHrManagerAgent(settings)],
+    ["orchestrator", renderOrchestratorAgent(settings, fullTeam)],
+    ...fullTeam.agents.map((agent) => [agent.name, renderRoleAgent(settings, fullTeam, agent)]),
+  ];
+
+  for (const [name, contents] of files) {
+    assert.ok(contents.startsWith(`---\nname: ${name}\ndescription: `), `frontmatter for ${name}`);
+    assert.match(contents, /^## Report format$/m);
+    assert.doesNotMatch(contents, PLACEHOLDER);
+  }
+
+  const backend = files.find(([name]) => name === "backend-engineer")[1];
+  assert.match(backend, /## Scope — files you own\n\n- `src\/`\n- `test\/`\n/);
+  assert.match(backend, /- `web\/` — that belongs to the \*\*frontend-engineer\*\*\./);
+  assert.match(backend, /- `\.claude\/agents\/` and the `CLAUDE\.md` roster table — that belongs to the \*\*hr-manager\*\*\./);
+  assert.match(backend, /Not for schema migrations or UI work\./);
+  assert.equal(backend.match(/<!-- FILL:/g).length, 2);
+
+  const auditor = files.find(([name]) => name === "auditor")[1];
+  assert.match(auditor, /^tools: Read, Grep, Glob, Bash$/m);
+  assert.match(auditor, /\*\*None\.\*\* You create, modify, and delete zero files\./);
+  assert.match(auditor, /`git status --short` is unchanged from when you started\.\n\n## Report format/);
+});
+
+test("agent descriptions stay valid YAML when the project name contains a colon", () => {
+  const settings = normalizeConfig({ project: { name: "Shop: Admin" } });
+
+  assert.match(renderHrManagerAgent(settings), /^description: "HR Manager for the Shop: Admin agent team\./m);
 });
