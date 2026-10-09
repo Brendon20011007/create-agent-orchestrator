@@ -187,6 +187,24 @@ npm run check
 
 Requires Node.js 20 or newer. The initializer has no runtime dependencies.
 
+### Releasing
+
+```bash
+npm run release                 # release the version in package.json
+npm run release -- patch        # bump first: patch, minor, major, or an explicit x.y.z
+npm run release -- --dry-run    # run the checks and show the plan; change nothing
+```
+
+Run it from the production branch (`branches.production` in `.agent-orchestrator.json`, here `main`) after `npm login`. It pushes to GitHub and publishes to npm in one go:
+
+1. Before changing anything it checks that you are on the production branch, the working tree is clean, the branch is not behind `origin`, `npm whoami` succeeds, the version is not on npm yet, and the tag `v<version>` is free or already points at the current commit. Every failed check is listed.
+2. It runs `npm run check` and stops if that fails.
+3. With a bump argument, `npm version` creates the release commit and tag. Without one, the current commit is tagged.
+4. The branch and the tag are pushed to `origin` in one atomic push.
+5. `npm publish` runs, and asks for a one-time password if the account needs one.
+
+If publishing fails after the push, run `npm run release` again with no argument to finish the same release. The script is not part of the published package.
+
 ## License
 
 MIT
