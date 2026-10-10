@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -35,6 +35,28 @@ async function withDirectory(run) {
     await rm(directory, { recursive: true, force: true });
   }
 }
+
+async function snapshot(directory, base = directory) {
+  const entries = {};
+
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const full = path.join(directory, entry.name);
+    const relative = path.relative(base, full);
+
+    if (entry.isDirectory()) Object.assign(entries, { [`${relative}/`]: "directory" }, await snapshot(full, base));
+    else entries[relative] = (await readFile(full)).toString("base64");
+  }
+
+  return entries;
+}
+
+async function initProject(target) {
+  const created = await execute([target, "--yes"], path.dirname(target));
+  assert.equal(created.code, 0, created.stderr);
+  return snapshot(target);
+}
+
+const SYNC_HINT = /\n\nThe current folder is an initialized project\. To sync it, leave the folder out:\n  create-agent-orchestrator sync/;
 
 test("CLI initializes a project non-interactively, then syncs it", async () => {
   await withDirectory(async (directory) => {
@@ -187,11 +209,125 @@ test("CLI init names adopted agents whose roster cells still need paths", async 
   });
 });
 
+test("CLI sync names a missing folder and points at the initialized current folder", async () => {
+  await withDirectory(async (directory) => {
+    const project = path.join(directory, "proj");
+    const before = await initProject(project);
+
+    const result = await execute(["sync", "./my-project", "--dry-run"], project);
+
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, /^Error: .*[\\/]proj[\\/]my-project does not exist\.$/m);
+    assert.doesNotMatch(result.stderr, /was not found|Initialize the project first/);
+    assert.match(result.stderr, SYNC_HINT);
+    assert.match(result.stderr, /^  create-agent-orchestrator sync --dry-run$/m);
+    assert.ok(!(await readdir(project)).includes("my-project"));
+    assert.deepEqual(await snapshot(project), before);
+  });
+});
+
+test("CLI sync hint repeats the sync flags that were passed, in a fixed order", async () => {
+  await withDirectory(async (directory) => {
+    const project = path.join(directory, "proj");
+    const before = await initProject(project);
+
+    const result = await execute(["sync", "./my-project", "--migrate", "--dry-run", "--force"], project);
+
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /my-project does not exist\./);
+    assert.match(result.stderr, SYNC_HINT);
+    assert.match(result.stderr, /^  create-agent-orchestrator sync --dry-run --migrate --force$/m);
+    assert.ok(!(await readdir(project)).includes("my-project"));
+    assert.deepEqual(await snapshot(project), before);
+  });
+});
+
+test("CLI sync gives no hint when the current folder is not an initialized project", async () => {
+  await withDirectory(async (directory) => {
+    const missing = await execute(["sync", "./nope"], directory);
+
+    assert.equal(missing.code, 1);
+    assert.match(
+      missing.stderr,
+      /^Error: .*[\\/]nope does not exist\. Pass the folder of a project that create-agent-orchestrator has initialized, or run sync inside that project with no folder\.$/m,
+    );
+    assert.doesNotMatch(missing.stderr, /The current folder is an initialized project/);
+
+    const here = await execute(["sync", "."], directory);
+
+    assert.equal(here.code, 1);
+    assert.match(here.stderr, /\.agent-orchestrator\.json was not found in .*\. Initialize the project first: create-agent-orchestrator <target-directory>\.\n$/);
+    assert.doesNotMatch(here.stderr, /The current folder is an initialized project/);
+    assert.deepEqual(await readdir(directory), []);
+  });
+});
+
+test("CLI sync keeps the initialize wording for an uninitialized folder and adds the hint", async () => {
+  await withDirectory(async (directory) => {
+    const project = path.join(directory, "proj");
+    const other = path.join(directory, "other");
+    const before = await initProject(project);
+    await mkdir(other);
+
+    const result = await execute(["sync", "../other"], project);
+
+    assert.equal(result.code, 1);
+    assert.match(
+      result.stderr,
+      /^Error: \.agent-orchestrator\.json was not found in .*[\\/]other\. Initialize the project first: create-agent-orchestrator <target-directory>\.$/m,
+    );
+    assert.match(result.stderr, SYNC_HINT);
+    assert.match(result.stderr, /^  create-agent-orchestrator sync$/m);
+    assert.deepEqual(await readdir(other), []);
+    assert.deepEqual(await snapshot(project), before);
+  });
+});
+
+test("CLI sync gives no hint when the target is the current folder", async () => {
+  await withDirectory(async (directory) => {
+    const project = path.join(directory, "proj");
+    await initProject(project);
+    await rm(path.join(project, "CLAUDE.md"));
+    await symlink(project, path.join(directory, "link"), "junction");
+    const before = await snapshot(project);
+
+    for (const args of [["sync"], ["sync", "."], ["sync", "../link", "--dry-run"]]) {
+      const result = await execute(args, project);
+
+      assert.equal(result.code, 1);
+      assert.match(result.stderr, /CLAUDE\.md was not found in .*\. Initialize the project first/);
+      assert.doesNotMatch(result.stderr, /The current folder is an initialized project/);
+    }
+
+    assert.deepEqual(await snapshot(project), before);
+  });
+});
+
+test("CLI sync still works with no folder and with the current folder", async () => {
+  await withDirectory(async (directory) => {
+    const project = path.join(directory, "proj");
+    const before = await initProject(project);
+
+    for (const args of [["sync"], ["sync", "."]]) {
+      const result = await execute(args, project);
+
+      assert.equal(result.code, 0, result.stderr);
+      assert.equal(result.stderr, "");
+      assert.match(result.stdout, /Nothing to change in .*proj:/);
+      assert.match(result.stdout, /2 existing agent files left untouched/);
+    }
+
+    assert.deepEqual(await snapshot(project), before);
+  });
+});
+
 test("CLI help documents both commands", async () => {
   const result = await execute(["--help"], tmpdir());
 
   assert.equal(result.code, 0, result.stderr);
   assert.match(result.stdout, /create-agent-orchestrator@latest sync \[target-directory\]/);
+  assert.match(result.stdout, /For sync, \[target-directory\] defaults to the current folder/);
   assert.match(result.stdout, /--migrate/);
   assert.match(result.stdout, /--agents <roster>/);
   assert.doesNotMatch(result.stdout, /--source-dirs|--project-type/);

@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { copyFile } from "node:fs/promises";
+import { copyFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { UsageError } from "./args.js";
 import { CONFIG_FILE, convertConfig, normalizeConfig, SCHEMA_VERSION } from "./config.js";
@@ -22,6 +22,27 @@ const BACKUPS = [
   ["CLAUDE.md", "CLAUDE.md.bak"],
   [CONFIG_FILE, `${CONFIG_FILE}.bak`],
 ];
+
+// Set as `code` on the UsageError, so a caller can tell the two apart without reading the message.
+export const SYNC_NO_DIRECTORY = "SYNC_NO_DIRECTORY";
+export const SYNC_NOT_INITIALIZED = "SYNC_NOT_INITIALIZED";
+
+function usageError(code, message) {
+  return Object.assign(new UsageError(message), { code });
+}
+
+async function assertDirectory(targetDir) {
+  let stats = null;
+
+  try {
+    stats = await stat(targetDir);
+  } catch (error) {
+    if (!["ENOENT", "ENOTDIR"].includes(error?.code)) throw error;
+  }
+
+  if (!stats) throw usageError(SYNC_NO_DIRECTORY, `${targetDir} does not exist.`);
+  if (!stats.isDirectory()) throw usageError(SYNC_NO_DIRECTORY, `${targetDir} is not a directory.`);
+}
 
 export function hasManagedSections(text) {
   return MARKER_HINT.test(text);
@@ -279,11 +300,14 @@ async function migrateProject(targetDir, rawConfig, existing, { force, dryRun })
 }
 
 export async function syncProject(targetDir, { migrate = false, force = false, dryRun = false } = {}) {
+  await assertDirectory(targetDir);
+
   const configText = await readOptional(path.join(targetDir, CONFIG_FILE));
   const claudeMd = await readOptional(path.join(targetDir, "CLAUDE.md"));
 
   if (configText === null || claudeMd === null) {
-    throw new UsageError(
+    throw usageError(
+      SYNC_NOT_INITIALIZED,
       `${configText === null ? CONFIG_FILE : "CLAUDE.md"} was not found in ${targetDir}. Initialize the project first: create-agent-orchestrator <target-directory>.`,
     );
   }

@@ -1,11 +1,11 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { readFile, stat } from "node:fs/promises";
+import { readFile, realpath, stat } from "node:fs/promises";
 import { parseArgs, UsageError } from "./args.js";
-import { normalizeConfig, splitList } from "./config.js";
+import { CONFIG_FILE, normalizeConfig, splitList } from "./config.js";
 import { createPrompter } from "./prompts.js";
-import { writeScaffold } from "./scaffold.js";
-import { syncProject } from "./sync.js";
+import { exists, writeScaffold } from "./scaffold.js";
+import { SYNC_NO_DIRECTORY, SYNC_NOT_INITIALIZED, syncProject } from "./sync.js";
 import { AGENTS_DIR, STARTER_ROLES, UNKNOWN_OWNERSHIP, describeRole, parseAgentsOption, pathKey } from "./team.js";
 import { CLAUDE_MD_FILL_NOTES, ROLE_FILL_NOTES } from "./templates.js";
 
@@ -255,6 +255,55 @@ function syncReport(result) {
   return report;
 }
 
+const SYNC_FLAGS = [
+  ["dryRun", "--dry-run"],
+  ["migrate", "--migrate"],
+  ["force", "--force"],
+];
+
+function syncCommand(options) {
+  const flags = SYNC_FLAGS.filter(([key]) => options[key]).map(([, flag]) => flag);
+  return ["create-agent-orchestrator sync", ...flags].join(" ");
+}
+
+async function sameDirectory(a, b) {
+  if (a === b) return true;
+
+  try {
+    return (await realpath(a)) === (await realpath(b));
+  } catch {
+    return false;
+  }
+}
+
+async function syncErrorAdvice(error, targetDir, cwd, options) {
+  if (!(error instanceof UsageError) || ![SYNC_NO_DIRECTORY, SYNC_NOT_INITIALIZED].includes(error.code)) return "";
+
+  const elsewhere = options.targetDir !== undefined && !(await sameDirectory(targetDir, cwd));
+
+  if (elsewhere && (await exists(path.join(cwd, CONFIG_FILE)))) {
+    return `\n\nThe current folder is an initialized project. To sync it, leave the folder out:\n  ${syncCommand(options)}`;
+  }
+
+  return error.code === SYNC_NO_DIRECTORY
+    ? " Pass the folder of a project that create-agent-orchestrator has initialized, or run sync inside that project with no folder."
+    : "";
+}
+
+async function runSync(targetDir, cwd, options) {
+  let result;
+
+  try {
+    result = await syncProject(targetDir, options);
+  } catch (error) {
+    const advice = await syncErrorAdvice(error, targetDir, cwd, options);
+    if (advice) error.message += advice;
+    throw error;
+  }
+
+  process.stdout.write(syncReport(result));
+}
+
 function helpText() {
   return `create-agent-orchestrator
 
@@ -265,6 +314,9 @@ Usage:
   npm create agent-orchestrator@latest [target-directory]
   npx create-agent-orchestrator@latest [target-directory] [options]
   npx create-agent-orchestrator@latest sync [target-directory] [sync options]
+
+  For sync, [target-directory] defaults to the current folder: run it inside an
+  initialized project and leave the folder out.
 
 Init options:
   -y, --yes                         Use defaults without interactive questions
@@ -361,10 +413,11 @@ export async function run(argv = process.argv.slice(2)) {
     return;
   }
 
-  const targetDir = path.resolve(process.cwd(), options.targetDir || ".");
+  const cwd = process.cwd();
+  const targetDir = path.resolve(cwd, options.targetDir || ".");
 
   if (options.command === "sync") {
-    process.stdout.write(syncReport(await syncProject(targetDir, options)));
+    await runSync(targetDir, cwd, options);
     return;
   }
 
